@@ -935,10 +935,14 @@ function readHtmlBlock(src, pos, hb) {
       const needle = hb.kind === 1 ? hb.endTag : hb.endMark;
       if (hay.includes(needle)) break;
     }
-    // Blank lines after the terminator belong to the raw text too.
+    // Bare newlines after the terminator belong to the raw text
+    // too (marked's trailing \n* / (\n+|$) for these kinds): only
+    // completely empty lines are consumed — a line holding spaces
+    // or tabs stops the run, which decides whether geTrim keeps
+    // the terminator line's own newline.
     while (cursor < src.length) {
       const bl = nextLine(src, cursor);
-      if (!isBlankLine(bl.text)) break;
+      if (bl.text !== '') break;
       cursor = bl.next;
     }
     return { node: { t: 'html', text: geTrim(src.slice(pos, cursor)) }, end: cursor };
@@ -1135,12 +1139,16 @@ function parseBlockList(src, defs) {
 // ---------------------------------------------------------------------
 
 function renderCodeBlock(node) {
+  // Marked's code renderer: a non-empty text renders as the text
+  // with one trailing newline removed, plus a newline — so a text
+  // of exactly "\n" (an empty fence over two blank lines) still
+  // renders one newline, while a truly empty text renders none.
   let body = node.text;
   if (body.endsWith('\n')) body = body.slice(0, -1);
   const escaped = escapeHtml(body, true);
   const lang = node.lang ? node.lang.split(/\s+/)[0] : '';
   const attr = lang ? ' class="language-' + escapeHtml(lang, false) + '"' : '';
-  return '<pre><code' + attr + '>' + (escaped === '' ? '' : escaped + '\n') + '</code></pre>\n';
+  return '<pre><code' + attr + '>' + (node.text === '' ? '' : escaped + '\n') + '</code></pre>\n';
 }
 
 function renderNodes(nodes, defs) {
@@ -1192,8 +1200,19 @@ function findMatchingBracket(src, openIdx) {
     if (ch === '`') {
       let run = 0;
       while (src[i + run] === '`') run += 1;
-      const close = findCodeSpanClose(src, i + run, run);
-      i = close === -1 ? i + run : close + run;
+      // Marked's label grammar admits backticks only as a code-span
+      // pair whose two runs may differ in length (the content holds
+      // no backtick at all), or as a run of at least two backticks
+      // immediately before the closing bracket (its ``+(?=\])
+      // alternative: the pattern's two literal backticks mean a
+      // single stray backtick never qualifies). An unpaired run
+      // anywhere else means this bracket never closes as a label.
+      if (run >= 2 && src[i + run] === ']') { i += run; continue; }
+      const nxt = src.indexOf('`', i + run);
+      if (nxt === -1) return -1;
+      let r2 = 0;
+      while (src[nxt + r2] === '`') r2 += 1;
+      i = nxt + r2;
       continue;
     }
     if (ch === '<') {
@@ -1342,8 +1361,10 @@ const EMAIL_PROTOCOL_RE = new RegExp('(?:mailto:' + EMAIL_CORE + '|xmpp:' + EMAI
 function scanExtendedAutolink(src, i, prev) {
   const ch = src[i];
   // mailto: / xmpp: forms; they may not start right after an
-  // alphanumeric character.
-  if ((ch === 'm' || ch === 'x') && !(prev !== undefined && /[A-Za-z0-9]/.test(prev))) {
+  // alphanumeric character. A startsWith pre-check keeps the
+  // protocol regex off the many words that merely start with m/x.
+  if ((ch === 'm' || ch === 'x') && !(prev !== undefined && /[A-Za-z0-9]/.test(prev)) &&
+      (src.startsWith('mailto:', i) || src.startsWith('xmpp:', i))) {
     EMAIL_PROTOCOL_RE.lastIndex = i;
     const m = EMAIL_PROTOCOL_RE.exec(src);
     if (m) {
@@ -1405,113 +1426,70 @@ function isPunctOrWs(ch) {
   return ch !== '' && ch !== undefined && PUNCT_OR_WS_RE.test(ch);
 }
 
-// True when src[from..to) contains an unescaped '[' or ']' outside
-// any code span.
-function labelHasBareBracket(src, from, to) {
-  let i = from;
-  while (i < to) {
-    const ch = src[i];
-    if (ch === '\\') { i += 2; continue; }
-    if (ch === '`') {
-      let run = 0;
-      while (src[i + run] === '`') run += 1;
-      const close = findCodeSpanClose(src, i + run, run);
-      i = close === -1 || close >= to ? i + run : close + run;
-      continue;
-    }
-    if (ch === '[' || ch === ']') return true;
-    i += 1;
+// Marked scans for emphasis closers over a masked copy of the
+// source (its Lexer.#n): reference links with a known target
+// collapse to [aaa...] first (a label that itself contains a link
+// stays visible, with only its [ref] part blanked), then escaped
+// punctuation outside code spans becomes ++, and finally every
+// blockSkip match — an inline link, a code span, or an HTML tag —
+// collapses to [aaa...]. The mask is length-preserving, so offsets
+// stay valid for the raw source. The three patterns below are
+// marked 18's own inline rules (reflinkSearch,
+// anyPunctuationOutsideCode, blockSkip), and the link rule is used
+// for the linkInText test inside the reflink step.
+const REFLINK_SEARCH_RE = /!?\[((?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\]|!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\](?:\[\])?(?!\()/g;
+const ANY_PUNCT_OUTSIDE_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const BLOCK_SKIP_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+const INLINE_LINK_TEST_RE = /^!?\[(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?\]\([ \t\n]*(<(?:\\.|[^\n<>\\])+>|[^ \t\n\x00-\x1f]+|(?=\)))(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^)\\])*\)))?[ \t\n]*\)/;
+
+// Marked's Lexer.linkInText: does this text contain a link (an
+// inline link found by blockSkip, or a reference link whose target
+// is defined and whose own label holds no link)?
+function linkInText(e, defs) {
+  if (!e.includes('[')) return false;
+  for (const n of e.matchAll(new RegExp(BLOCK_SKIP_RE.source, 'g'))) {
+    if (INLINE_LINK_TEST_RE.test(n[0]) && e.charAt(n.index - 1) !== '!') return true;
+  }
+  for (const n of e.matchAll(new RegExp(REFLINK_SEARCH_RE.source, 'g'))) {
+    const s = n[0];
+    const r = s.lastIndexOf('[');
+    if (s.charAt(0) === '!' || !defs.has(normaliseLabel(s.slice(r + 1, -1)))) continue;
+    if (r > 1 && linkInText(s.slice(1, r - 1), defs)) continue;
+    return true;
   }
   return false;
 }
 
-// Marked scans for emphasis closers over a masked copy of the
-// source: escaped punctuation becomes ++, and code spans, links,
-// images and HTML tags collapse to [aaa...], so a delimiter inside
-// one of those constructs never takes part in emphasis matching.
-// The mask is length-preserving, so offsets stay valid for the raw
-// source.
+// One reflinkSearch match under marked's masking: unknown targets
+// stay as they are; a known target blanks the whole match, except
+// that a label containing a link keeps its (recursively masked)
+// label and blanks only the [ref] part.
+function maskReflinkMatch(r, defs) {
+  const o = r.lastIndexOf('[');
+  if (!defs.has(normaliseLabel(r.slice(o + 1, -1)))) return r;
+  if (o > 1 && r.charAt(0) !== '!') {
+    const inner = r.slice(1, o - 1);
+    if (linkInText(inner, defs)) {
+      const maskedInner = inner.replace(REFLINK_SEARCH_RE, (m) => maskReflinkMatch(m, defs));
+      return '[' + maskedInner + '][' + 'a'.repeat(Math.max(0, r.length - o - 2)) + ']';
+    }
+  }
+  return '[' + 'a'.repeat(Math.max(0, r.length - 2)) + ']';
+}
+
 function maskForScan(src, defs) {
   if (!src.includes('\\') && !src.includes('`') && !src.includes('<') && !src.includes('[')) return src;
-  let out = '';
-  let i = 0;
-  const n = src.length;
-  const blank = (len) => '[' + 'a'.repeat(Math.max(0, len - 2)) + ']';
-  while (i < n) {
-    const ch = src[i];
-    if (ch === '\\' && i + 1 < n && isPunctChar(src[i + 1])) {
-      out += '++';
-      i += 2;
-      continue;
-    }
-    if (ch === '`') {
-      let run = 0;
-      while (src[i + run] === '`') run += 1;
-      const close = findCodeSpanClose(src, i + run, run);
-      if (close !== -1) {
-        const len = close + run - i;
-        out += blank(len);
-        i += len;
-        continue;
-      }
-      out += '`'.repeat(run);
-      i += run;
-      continue;
-    }
-    if (ch === '<') {
-      const scheme = AUTOLINK_SCHEME.exec(src.slice(i, i + 1200));
-      const email = scheme ? null : AUTOLINK_EMAIL.exec(src.slice(i, i + 400));
-      const html = scheme || email ? null : scanInlineHtml(src, i);
-      const len = scheme ? scheme[0].length : email ? email[0].length : html ? html.length : 0;
-      if (len > 0) {
-        out += blank(len);
-        i += len;
-        continue;
-      }
-      out += ch;
-      i += 1;
-      continue;
-    }
-    if (ch === '[' || (ch === '!' && src[i + 1] === '[')) {
-      const openIdx = ch === '!' ? i + 1 : i;
-      const closeIdx = findMatchingBracket(src, openIdx);
-      if (closeIdx !== -1) {
-        const textRaw = src.slice(openIdx + 1, closeIdx);
-        const tail = readLinkTail(src, closeIdx, defs, textRaw);
-        if (tail) {
-          if (src[closeIdx + 1] === '(') {
-            // Marked's blockSkip only masks an inline link whose
-            // label holds no bare brackets outside code spans; a
-            // nested label stays visible to the emphasis scan.
-            if (!labelHasBareBracket(src, openIdx + 1, closeIdx)) {
-              out += blank(tail.end - i);
-              i = tail.end;
-              continue;
-            }
-          } else if (src[closeIdx + 1] === '[') {
-            // A reference link whose label itself contains a link
-            // keeps its label visible; only the [ref] is masked
-            // (it is blanked when the scan reaches it as a shortcut).
-            if (!textRaw.includes('[')) {
-              out += blank(tail.end - i);
-              i = tail.end;
-              continue;
-            }
-          } else {
-            out += blank(tail.end - i);
-            i = tail.end;
-            continue;
-          }
-        }
-      }
-      out += ch;
-      i += 1;
-      continue;
-    }
-    out += ch;
-    i += 1;
+  let t = src;
+  if (defs.size > 0 && src.includes('[')) {
+    t = t.replace(REFLINK_SEARCH_RE, (m) => maskReflinkMatch(m, defs));
   }
-  return out;
+  t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (n, s, r) => (r
+    ? '+'.repeat(n.length)
+    : s
+      ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s
+      : n));
+  t = t.replace(BLOCK_SKIP_RE, (n) => '[' + 'a'.repeat(Math.max(0, n.length - 2)) + ']');
+  return t;
 }
 
 // Per-string scan context, built lazily on the first emphasis or
@@ -2032,6 +2010,49 @@ function sameListMarker(line, list) {
   return mk;
 }
 
+// Expand tabs in the leading whitespace of `text` to spaces, the
+// first character sitting at column `baseCol` (marked's J function,
+// which its list gathering applies to the lines it inspects).
+function expandLeadingTabs(text, baseCol) {
+  let out = '';
+  let col = baseCol;
+  let i = 0;
+  while (i < text.length && (text[i] === ' ' || text[i] === '\t')) {
+    if (text[i] === ' ') { out += ' '; col += 1; i += 1; }
+    else { const w = 4 - (col % 4); out += ' '.repeat(w); col += w; i += 1; }
+  }
+  return out + text.slice(i);
+}
+
+// Does a construct begin at offset j of `text`? The kinds are
+// marked's list-gathering begin tests: fence, heading, HTML,
+// blockquote, bullet, thematic break.
+function constructAt(text, j, kind) {
+  if (kind === 'fence') return text.startsWith('```', j) || text.startsWith('~~~', j);
+  if (kind === 'heading') return /^#{1,6}(?:[ \t]|$)/.test(text.slice(j));
+  if (kind === 'quote') return text[j] === '>';
+  if (kind === 'bullet') return /^(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(text.slice(j));
+  if (kind === 'hr') return /^(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})$/.test(text.slice(j));
+  // html: a block tag, a script/pre/style/textarea start, a
+  // comment, a processing instruction, a declaration, or CDATA.
+  const rest = text.slice(j);
+  const tag = /^<\/?([A-Za-z][A-Za-z0-9-]*)(?: +|$|\/?>)/.exec(rest);
+  if (tag && BLOCK_TAGS.has(tag[1].toLowerCase())) return true;
+  return /^<(?:(?:script|pre|style|textarea)(?:[ \t>]|$)|!--)/i.test(rest) ||
+    rest.startsWith('<?') || /^<![A-Z]/.test(rest) || rest.startsWith('<![CDATA[');
+}
+
+// Marked's *BeginRegex(R) family: a construct that begins within
+// the first R-1 columns of the line, counted in literal spaces and
+// capped at 3 (a construct deeper than that is content, not a
+// boundary).
+function beginsWithin(text, contentIndent, kinds) {
+  let spaces = 0;
+  while (text[spaces] === ' ') spaces += 1;
+  if (spaces > Math.min(contentIndent - 1, 3)) return false;
+  return kinds.some((kind) => constructAt(text, spaces, kind));
+}
+
 // Collect one list item whose marker line starts at `pos`.
 // Returns { lines, end, spannedBlank } where `end` is the offset of
 // the first line that no longer belongs to the item and
@@ -2045,52 +2066,60 @@ function readListItem(src, pos, mk, contentIndent) {
   let contentEnd = cursor;
   let pendingBlanks = 0;
   let spannedBlank = false;
-  // A fence opened inside the item swallows following lines until it
-  // closes, even lines that are not indented into the item.
-  let openFence = fenceStart(firstContent);
+  // Marked's gathering state: `wasBlank` says the previously
+  // gathered line was blank, and `prevTest` is that line in the
+  // form the lazy-continuation break tests inspect (leading tabs
+  // expanded, then the content indent sliced off in characters;
+  // for the first line, the raw rest of the marker line).
+  let wasBlank = firstContent.trim() === '';
+  let prevTest = expandLeadingTabs(afterMarker, mk.indent.cols + mk.markerChars);
   while (cursor < src.length) {
     const ln = nextLine(src, cursor);
-    if (openFence) {
-      const dedented = measureIndent(ln.text).cols >= contentIndent
-        ? dropColumns(ln.text, 0, contentIndent)
-        : ln.text;
-      if (pendingBlanks > 0) spannedBlank = true;
-      for (let b = 0; b < pendingBlanks; b++) lines.push('');
-      pendingBlanks = 0;
-      lines.push(dedented);
-      cursor = ln.next;
-      contentEnd = cursor;
-      if (fenceClose(dedented, openFence)) openFence = null;
-      continue;
-    }
-    if (isBlankLine(ln.text)) {
+    const f = ln.text;
+    // A construct that begins before the content column — fence,
+    // heading, HTML, blockquote, bullet or thematic break — ends
+    // the item, whatever the item currently ends with.
+    if (beginsWithin(f, contentIndent, ['fence', 'heading', 'html', 'quote', 'bullet', 'hr'])) break;
+    if (isBlankLine(f)) {
       // A blank line before the item has any content ends the item.
       if (!lines.some(l => l.trim() !== '')) break;
-      pendingBlanks += 1; cursor = ln.next; continue;
+      pendingBlanks += 1;
+      cursor = ln.next;
+      wasBlank = true;
+      prevTest = expandLeadingTabs(f, 0).slice(contentIndent);
+      continue;
     }
-    const lineIndent = measureIndent(ln.text).cols;
-    if (lineIndent >= contentIndent) {
+    if (measureIndent(f).cols >= contentIndent) {
       if (pendingBlanks > 0) spannedBlank = true;
       for (let b = 0; b < pendingBlanks; b++) lines.push('');
       pendingBlanks = 0;
-      const dedented = dropColumns(ln.text, 0, contentIndent);
-      lines.push(dedented);
-      if (!openFence) openFence = fenceStart(dedented);
+      lines.push(dropColumns(f, 0, contentIndent));
       cursor = ln.next;
       contentEnd = cursor;
+      wasBlank = false;
+      prevTest = expandLeadingTabs(f, 0).slice(contentIndent);
       continue;
     }
-    // A line starting a new list item never joins this item.
-    if (listMarker(ln.text)) break;
-    // Not indented enough: the item continues only as a lazy
-    // paragraph continuation, and only with no blank line before it.
-    if (pendingBlanks === 0 && lines.length && itemLazyOk(lines, ln.text)) {
-      lines.push(setextLevel(ln.text) ? ' ' + ln.text.replace(/^ {0,3}/, '') : ln.text);
-      cursor = ln.next;
-      contentEnd = cursor;
-      continue;
+    // Not indented into the item: the line joins only as a lazy
+    // continuation, and marked allows that only when the previous
+    // line was not blank, was not itself indented code, and does
+    // not begin a fence, heading, HTML block or thematic break.
+    // (This is why a fence's unindented content line joins when it
+    // follows an indented content line, but not when it directly
+    // follows the fence's opening line.)
+    if (wasBlank) break;
+    if (prevTest.replace(/\t/g, '    ').search(/\S/) >= 4) break;
+    if (beginsWithin(prevTest, contentIndent, ['fence', 'heading', 'html', 'hr'])) break;
+    if (/^ {0,3}(?:=+|-+) *$/.test(f) && itemLazyOk(lines, f)) {
+      // A setext underline joins in marked's indented form.
+      lines.push('    ' + expandLeadingTabs(f, 0).replace(/^ {0,3}/, ''));
+    } else {
+      lines.push(f);
     }
-    break;
+    cursor = ln.next;
+    contentEnd = cursor;
+    wasBlank = false;
+    prevTest = expandLeadingTabs(f, 0).slice(contentIndent);
   }
   return { lines, end: contentEnd, spannedBlank };
 }
